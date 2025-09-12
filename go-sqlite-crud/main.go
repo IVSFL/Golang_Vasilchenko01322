@@ -2,38 +2,52 @@ package main
 
 import (
 	"database/sql"
-	"encoding/json" // Кодирование и декодирование (Сериализация)
+	"encoding/json"
 	"log"
-	"net/http" // HTTP-сервер, обработка запроса
-	"strconv"  // Преобразование строки в число
+	"net/http"
+	"strconv"
 
-	"github.com/gorilla/mux" // Роутер
-	_ "modernc.org/sqlite"   // Драйвер SQLite
+	"github.com/gorilla/mux"
+	_ "modernc.org/sqlite"
 )
 
 type CarBrand struct {
-	ID int `json:"id"`
-	Name string `json:"name"`
-	Country string `json:"country"`
-	Year int `json:"year_founded"`
-	Capitalization int `json:"capitalization"`
+	ID            int    `json:"id"`
+	Name          string `json:"name"`
+	Country       string `json:"country"`
+	Year          int    `json:"year"`
+	Capitalization int   `json:"capitalization"`
 }
 
-var db *sql.DB // Переменая для соединения с базой данных
+var db *sql.DB
+
+// Middleware для CORS
+func enableCORS(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
 
 func main() {
 	var err error
 
-	// Открыть (создать) файл БД в текущей директории
-	db, err = sql.Open("sqlite", "D:/Doc/GO Dewelopment/go-sqlite-crud/car_brands.db")
+	db, err = sql.Open("sqlite", "carBrand.db")
 	if err != nil {
 		log.Fatalf("DB open: %v", err)
 	}
 	defer db.Close()
+	db.SetMaxOpenConns(1)
 
-	db.SetMaxOpenConns(1) // Ограничение на запись
-
-	// Создать БД, если нету. Exec() выполнит запрос без возврата строк
+	// Создание таблицы
 	_, err = db.Exec(`
 	CREATE TABLE IF NOT EXISTS car_brands (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -43,7 +57,7 @@ func main() {
 		capitalization INTEGER NOT NULL
 	);`)
 	if err != nil {
-		log.Fatalf("DB open: %v", err)
+		log.Fatalf("DB create: %v", err)
 	}
 
 	// Роуты
@@ -55,9 +69,10 @@ func main() {
 	router.HandleFunc("/carBrands/{id}", deleteCarBrand).Methods("DELETE")
 
 	// Запуск сервера
-	log.Println("Сервер запущен, порт :8080")
-	log.Fatal(http.ListenAndServe(":8080", router))
+	log.Println("Сервер запущен на порту :8080")
+	log.Fatal(http.ListenAndServe(":8080", enableCORS(router)))
 }
+
 
 // Create
 func createCarBrand(w http.ResponseWriter, r *http.Request) {
@@ -71,7 +86,7 @@ func createCarBrand(w http.ResponseWriter, r *http.Request) {
 	}
 	res, err := db.Exec("INSERT INTO car_brands(name, country, year, capitalization) VALUES(?, ?, ?, ?)", cb.Name, cb.Country, cb.Year, cb.Capitalization)
 	if err != nil {
-		http.Error(w, "inser failed: " + err.Error(), http.StatusInternalServerError)
+		http.Error(w, "insert failed: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 	id, _ := res.LastInsertId()
@@ -85,16 +100,16 @@ func getCarBrands(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	rows, err := db.Query("SELECT id, name, country, year, capitalization FROM car_brands")
 	if err != nil {
-		http.Error(w, "query failed: " + err.Error(), http.StatusInternalServerError)
+		http.Error(w, "query failed: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 	defer rows.Close()
 
 	carBrands := []CarBrand{}
-	for rows.Next(){
+	for rows.Next() {
 		var cb CarBrand
 		if err := rows.Scan(&cb.ID, &cb.Name, &cb.Country, &cb.Year, &cb.Capitalization); err != nil {
-			http.Error(w, "scan failed: " + err.Error(), http.StatusInternalServerError)
+			http.Error(w, "scan failed: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
 		carBrands = append(carBrands, cb)
@@ -108,18 +123,19 @@ func getCarBrand(w http.ResponseWriter, r *http.Request) {
 	idStr := mux.Vars(r)["id"]
 	id, err := strconv.Atoi(idStr)
 	if err != nil {
-		http.Error(w, "invalid id", http.StatusInternalServerError)
+		http.Error(w, "invalid id", http.StatusBadRequest)
 		return
 	}
 
-	var cb CarBrand 
-	err = db.QueryRow("SELECT id, name, country, year, capitalization FROM car_brands WHERE id = ?", id).Scan(&cb.ID, &cb.Name, &cb.Country, &cb.Year, &cb.Capitalization)
+	var cb CarBrand
+	err = db.QueryRow("SELECT id, name, country, year, capitalization FROM car_brands WHERE id = ?", id).
+		Scan(&cb.ID, &cb.Name, &cb.Country, &cb.Year, &cb.Capitalization)
 	if err == sql.ErrNoRows {
-		http.Error(w, "not found", http.StatusInternalServerError)
+		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
 	if err != nil {
-		http.Error(w, "query failed", http.StatusInternalServerError)
+		http.Error(w, "query failed: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 	json.NewEncoder(w).Encode(cb)
@@ -135,19 +151,20 @@ func updateCarBrand(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid id", http.StatusBadRequest)
 		return
 	}
-	 var cb CarBrand
-	 if err := json.NewDecoder(r.Body).Decode(&cb); err != nil {
+
+	var cb CarBrand
+	if err := json.NewDecoder(r.Body).Decode(&cb); err != nil {
 		http.Error(w, "invalid JSON", http.StatusBadRequest)
 		return
-	 }
+	}
 
-	 _, err = db.Exec("UPDATE car_brands SET name = ?, country = ?, year = ?, capitalization = ? WHERE id = ?", cb.Name, cb.Country, cb.Year, cb.Capitalization, id)
-	 if err != nil {
-		http.Error(w, "update failed: " + err.Error(), http.StatusInternalServerError)
+	_, err = db.Exec("UPDATE car_brands SET name = ?, country = ?, year = ?, capitalization = ? WHERE id = ?", cb.Name, cb.Country, cb.Year, cb.Capitalization, id)
+	if err != nil {
+		http.Error(w, "update failed: "+err.Error(), http.StatusInternalServerError)
 		return
-	 }
-	 cb.ID = id
-	 json.NewEncoder(w).Encode(cb)
+	}
+	cb.ID = id
+	json.NewEncoder(w).Encode(cb)
 }
 
 // Delete
@@ -161,7 +178,7 @@ func deleteCarBrand(w http.ResponseWriter, r *http.Request) {
 
 	_, err = db.Exec("DELETE FROM car_brands WHERE id = ?", id)
 	if err != nil {
-		http.Error(w, "delete failed: " + err.Error(), http.StatusInternalServerError)
+		http.Error(w, "delete failed: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
