@@ -10,6 +10,11 @@
       <input v-model.number="newCar.capitalization" placeholder="Капитализация" />
       <button @click="saveCarBrand">Добавить</button>
     </div>
+    <div v-if="errorMessage.length">
+      <ul>
+        <li v-for="err in errorMessage" :key="err">{{ err }}</li>
+      </ul>
+    </div>
 
     <!-- таблица -->
     <table border="1" cellpadding="5">
@@ -41,7 +46,8 @@
 </template>
 
 <script>
-import axios from "axios";
+//import axios from "axios";
+import api from "./api.js"
 
 export default {
   name: "App",
@@ -50,32 +56,82 @@ export default {
       carBrands: [],
       newCar: { name: "", country: "", year: "", capitalization: "" },
       editing: null,
+      errorMessage: [],
+      count: 0
     };
   },
   created() {
     this.fetchCarBrands();
   },
   methods: {
+    validateCar(car) {
+      const errors = [];
+      // Пустые поля
+      if(!car.name) errors.push("Поле 'Название' не должно быть пустым");
+      if(!car.country) errors.push("Поле 'Страна' не должно быть пустым");
+      if(!car.year) errors.push("Поле 'Год' не должно быть пустым");
+      if(!car.capitalization) errors.push("Поле 'Капитализация' не должно быть пустым")
+
+      // Проверка чисел
+      const currentDate = new Date();
+      const currentYear = currentDate.getFullYear();
+      if(car.year && isNaN(Number(car.year)) || Number(car.year) > currentYear) errors.push("Поле 'Год' может состоять только из цифр, и не быть больше текущего года");
+      if(car.capitalization && isNaN(Number(car.capitalization))) errors.push("Поле 'Капитализация' может состоять только из цифр");
+
+      // Уникальное название
+      if(!this.editing && this.carBrands.some(c => c.name === car.name)) {
+        errors.push("Такое название уже существует")
+      }
+
+      // Проверка букв и пробелов
+      const regex = /^[a-zA-Z\s]+$/;
+      if(car.name && !regex.test(car.name)) errors.push("Поле 'Название' может состоять только из букв и пробелов");
+      if(car.country && !regex.test(car.country)) errors.push("Поле 'Страна' может состоять только из букв и пробелов")
+
+      this.errorMessage = errors;
+
+      return errors.length === 0;
+    },
+
     async fetchCarBrands() {
-      const res = await axios.get("http://localhost:8080/carBrands");
+      const res = await api.get("/carBrands");
       this.carBrands = res.data;
     },
     async saveCarBrand() {
-      if (this.editing) {
-        await axios.put(`http://localhost:8080/carBrands/${this.editing.id}`, this.newCar);
-        this.editing = null;
-      } else {
-        await axios.post("http://localhost:8080/carBrands", this.newCar);
+      const payload = {
+        ...this.newCar,
+        year: Number(this.newCar.year),
+        capitalization: Number(this.newCar.capitalization),
+      };
+      
+      // Валидация
+      if(!this.validateCar(payload)) return;
+
+      try {
+        if(this.editing) {
+          // Редакутирование
+          await api.put(`/carBrands/${this.editing.id}`, payload);
+          this.editing = null;
+        } else {
+          // Добавление
+          await api.post("/carBrands", payload);
+        }
+
+        // Очистка форм
+        this.errorMessage = [];
+        this.newCar = { name: "", country: "", year: "", capitalization: "" };
+        this.fetchCarBrands();
+      } catch(err) {
+        this.errorMessage = ["Ошибка при сохранении"];
+        console.log(err);
       }
-      this.newCar = { name: "", country: "", year: "", capitalization: "" };
-      this.fetchCarBrands();
     },
     editCarBrand(car) {
-      this.newCar = { ...car, year: car.year_founded }; // поле в API называется year
+      this.newCar = { ...car,}; 
       this.editing = car;
     },
     async deleteCarBrand(id) {
-      await axios.delete(`http://localhost:8080/carBrands/${id}`);
+      await api.delete(`/carBrands/${id}`);
       this.fetchCarBrands();
     },
   },

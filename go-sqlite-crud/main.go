@@ -5,9 +5,14 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"os"
 	"strconv"
+	"strings"
+	"time"
 
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/gorilla/mux"
+	"golang.org/x/crypto/bcrypt"
 	_ "modernc.org/sqlite"
 )
 
@@ -19,16 +24,26 @@ type CarBrand struct {
 	Capitalization int   `json:"capitalization"`
 }
 
+type User struct {
+	ID int `json:"id"`
+	Login string `json:"login"`
+	Password string `json:"password"`
+}
+
 var db *sql.DB
 
-// Middleware для CORS
+var jwtKey []byte
+
+// Middleware для CORS с логированием preflight-запросов
 func enableCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
+		// Разрешаем запросы только с вашего фронтенда
+		w.Header().Set("Access-Control-Allow-Origin", "http://localhost:8081")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Accept, X-Requested-With")
 
 		if r.Method == "OPTIONS" {
+			log.Println("Preflight request:", r.Method, r.URL.Path, r.Header)
 			w.WriteHeader(http.StatusOK)
 			return
 		}
@@ -38,6 +53,14 @@ func enableCORS(next http.Handler) http.Handler {
 }
 
 func main() {
+	// Читаем JWT ключ из переменной окружения
+	k := os.Getenv("JWT_KEY")
+	if k == "" {
+		log.Println("WARNING")
+		k = "dev_secret_replace_me"
+	}
+	jwtKey = []byte(k)
+
 	var err error
 
 	db, err = sql.Open("sqlite", "carBrand.db")
@@ -55,13 +78,19 @@ func main() {
 		country TEXT NOT NULL,
 		year INTEGER NOT NULL,
 		capitalization INTEGER NOT NULL
-	);`)
+	);
+	CREATE TABLE IF NOT EXISTS users (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		login TEXT UNIQUE NOT NULL,
+		password TEXT NOT NULL
+		);`)
 	if err != nil {
 		log.Fatalf("DB create: %v", err)
 	}
 
-	// Роуты
+	// Роутер
 	router := mux.NewRouter()
+	
 	router.HandleFunc("/carBrands", createCarBrand).Methods("POST")
 	router.HandleFunc("/carBrands", getCarBrands).Methods("GET")
 	router.HandleFunc("/carBrands/{id}", getCarBrand).Methods("GET")
@@ -72,7 +101,6 @@ func main() {
 	log.Println("Сервер запущен на порту :8080")
 	log.Fatal(http.ListenAndServe(":8080", enableCORS(router)))
 }
-
 
 // Create
 func createCarBrand(w http.ResponseWriter, r *http.Request) {
