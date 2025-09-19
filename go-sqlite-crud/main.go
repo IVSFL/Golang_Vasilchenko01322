@@ -3,6 +3,7 @@ package main
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"log"
 	"net/http"
 	"os"
@@ -31,8 +32,42 @@ type User struct {
 }
 
 var db *sql.DB
-
 var jwtKey []byte
+
+// Хэширование пароля
+func hashPassword(password string) (string, error) {
+	bytes, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	return string(bytes), err
+}
+
+// Проверка хэшированного пароля
+func checkPasswordHash(password, hash string) bool {
+	err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(password))
+	return err == nil
+}
+
+// Генерация JWT токена
+func generateToken(login string) (string, error) {
+	claims := jwt.RegisteredClaims {
+		Subject: login,
+		ExpiresAt: jwt.NewNumericDate(time.Now().Add(24 * time.Hour)),
+		IssuedAt: jwt.NewNumericDate(time.Now()),
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	return token.SignedString(jwtKey)
+}
+
+// Валидация JWT токена
+func parseToken(tokenStr string) (*jwt.RegisteredClaims, error) {
+	claims := &jwt.RegisteredClaims{}
+	token, err := jwt.ParseWithClaims(tokenStr, claims, func(token *jwt.Token) (interface{}, error) {
+		return jwtKey, nil // вернем ключ для проверки
+	})
+	if err != nil || !token.Valid {
+		return nil, errors.New("invalid token")
+	}
+	return claims, nil
+}
 
 // Middleware для CORS с логированием preflight-запросов
 func enableCORS(next http.Handler) http.Handler {
@@ -40,7 +75,7 @@ func enableCORS(next http.Handler) http.Handler {
 		// Разрешаем запросы только с вашего фронтенда
 		w.Header().Set("Access-Control-Allow-Origin", "http://localhost:8081")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Accept, X-Requested-With")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Accept, X-Requested-With, Authorization")
 
 		if r.Method == "OPTIONS" {
 			log.Println("Preflight request:", r.Method, r.URL.Path, r.Header)
@@ -52,54 +87,76 @@ func enableCORS(next http.Handler) http.Handler {
 	})
 }
 
-func main() {
-	// Читаем JWT ключ из переменной окружения
-	k := os.Getenv("JWT_KEY")
-	if k == "" {
-		log.Println("WARNING")
-		k = "dev_secret_replace_me"
+// Проверка токена, для защищенных маршрутов
+func authMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
+		if auth == "" {
+			http.Error(w, "missing token", http.StatusUnauthorized)
+			return
+		}
+		tokenStr := strings.TrimSpace(strings.TrimPrefix(auth, "Bearer "))
+		_, err := parseToken(tokenStr)
+		if err != nil {
+			http.Error(w, "invalid token", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+//Регистрация нового пользователя
+func register(w http.ResponseWriter, r *http.Request) {
+	var u User
+	defer r.Body.Close()
+	if err := json.NewDecoder(r.Body).Decode(&u); err != nil {
+		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		return
 	}
-	jwtKey = []byte(k)
+	if u.Login == "" || u.Password == "" {
+		http.Error(w, "login and password required", http.StatusBadRequest)
+		return
+	}
 
-	var err error
+	// Хэшируем пароль
+	hash, _ := hashPassword(u.Password)
 
-	db, err = sql.Open("sqlite", "carBrand.db")
+	// Сохранение в БД
+	_, err := db.Exec("INSERT INTO users(login, password) VALUES(?, ?)", u.Login, hash)
 	if err != nil {
-		log.Fatalf("DB open: %v", err)
+		http.Error(w, "user exist or insert failed", http.StatusBadRequest)
+		return
 	}
-	defer db.Close()
-	db.SetMaxOpenConns(1)
 
-	// Создание таблицы
-	_, err = db.Exec(`
-	CREATE TABLE IF NOT EXISTS car_brands (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		name TEXT NOT NULL,
-		country TEXT NOT NULL,
-		year INTEGER NOT NULL,
-		capitalization INTEGER NOT NULL
-	);
-	CREATE TABLE IF NOT EXISTS users (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		login TEXT UNIQUE NOT NULL,
-		password TEXT NOT NULL
-		);`)
+	w.WriteHeader(http.StatusCreated)
+}
+
+// Логин пользователя
+func login(w http.ResponseWriter, r *http.Request) {
+	var u User
+	defer r.Body.Close()
+	if err := json.NewDecoder(r.Body).Decode(&u); err != nil {
+		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	// Ищем пользователя в БД
+	var storeHash string
+	err := db.QueryRow("SELECT password FROM users WHERE login = ?", u.Login).Scan(&storeHash)
 	if err != nil {
-		log.Fatalf("DB create: %v", err)
+		http.Error(w, "no access", http.StatusBadRequest)
+		return
 	}
 
-	// Роутер
-	router := mux.NewRouter()
-	
-	router.HandleFunc("/carBrands", createCarBrand).Methods("POST")
-	router.HandleFunc("/carBrands", getCarBrands).Methods("GET")
-	router.HandleFunc("/carBrands/{id}", getCarBrand).Methods("GET")
-	router.HandleFunc("/carBrands/{id}", updateCarBrand).Methods("PUT")
-	router.HandleFunc("/carBrands/{id}", deleteCarBrand).Methods("DELETE")
+	// Проверка пароля
+	if !checkPasswordHash(u.Password, storeHash) {
+		http.Error(w, "invalid password", http.StatusUnauthorized)
+		return
+	}
 
-	// Запуск сервера
-	log.Println("Сервер запущен на порту :8080")
-	log.Fatal(http.ListenAndServe(":8080", enableCORS(router)))
+	// Генератор токена
+	token, _ := generateToken(u.Login)
+	json.NewEncoder(w).Encode(map[string]string{"token": token})
 }
 
 // Create
@@ -211,3 +268,65 @@ func deleteCarBrand(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
+
+func main() {
+	// Читаем JWT ключ из переменной окружения
+	k := os.Getenv("JWT_KEY")
+	if k == "" {
+		log.Println("WARNING")
+		k = "dev_secret_replace_me"
+	}
+	jwtKey = []byte(k)
+
+	var err error
+
+	db, err = sql.Open("sqlite", "carBrand.db")
+	if err != nil {
+		log.Fatalf("DB open: %v", err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+
+	// Создание таблицы
+	_, err = db.Exec(`
+	CREATE TABLE IF NOT EXISTS car_brands (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		name TEXT NOT NULL,
+		country TEXT NOT NULL,
+		year INTEGER NOT NULL,
+		capitalization INTEGER NOT NULL
+	);
+`)
+if err != nil { log.Fatalf("DB create car_brands: %v", err) }
+
+_, err = db.Exec(`
+	CREATE TABLE IF NOT EXISTS users (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		login TEXT UNIQUE NOT NULL,
+		password TEXT NOT NULL
+	);
+`)
+if err != nil { log.Fatalf("DB create users: %v", err) }
+
+	// Роутер
+	router := mux.NewRouter()
+
+	// Публичные запросы
+	router.HandleFunc("/register", register).Methods("POST")
+	router.HandleFunc("/login", login).Methods("POST")
+
+	// Защищенные запросы
+	api := router.PathPrefix("/carBrands").Subrouter()
+	api.Use(authMiddleware)
+	
+	api.HandleFunc("/", createCarBrand).Methods("POST")
+	api.HandleFunc("/", getCarBrands).Methods("GET")
+	api.HandleFunc("/{id}", getCarBrand).Methods("GET")
+	api.HandleFunc("/{id}", updateCarBrand).Methods("PUT")
+	api.HandleFunc("/{id}", deleteCarBrand).Methods("DELETE")
+
+	// Запуск сервера
+	log.Println("Сервер запущен на порту :8080")
+	log.Fatal(http.ListenAndServe(":8080", enableCORS(router)))
+}
+
